@@ -393,6 +393,7 @@ class TestSlashCommands:
         assert "/model" in result
         assert "/tools" in result
         assert "/reset" in result
+        assert "/plan" in result
 
     def test_model_shows_current(self, agent, mock_manager):
         state = self._make_state(mock_manager)
@@ -505,3 +506,80 @@ class TestSlashCommands:
         assert state.agent.provider == "anthropic"
         assert state.agent.base_url == "https://anthropic.example/v1"
         assert runtime_calls[-1] == "anthropic"
+
+
+# ---------------------------------------------------------------------------
+# /plan slash command
+# ---------------------------------------------------------------------------
+
+
+class TestPlanSlashCommand:
+    def _make_state(self, mock_manager):
+        state = mock_manager.create_session(cwd="/tmp")
+        state.agent.model = "test-model"
+        state.agent.provider = "openrouter"
+        state.model = "test-model"
+        return state
+
+    def test_plan_no_args_no_todos(self, agent, mock_manager):
+        """`/plan` with no args and no todos should say no active plan."""
+        state = self._make_state(mock_manager)
+        # Ensure mock agent has no todo store (MagicMock returns mock for any attr)
+        # so getattr will find a mock _todo_store - set it to None to test "no plan"
+        state.agent._todo_store = None
+        result = agent._handle_slash_command("/plan", state)
+        assert result is not None
+        assert "No active plan" in result
+
+    def test_plan_no_args_with_todos(self, agent, mock_manager):
+        """`/plan` with no args and existing todos should show them."""
+        from tools.todo_tool import TodoStore
+
+        state = self._make_state(mock_manager)
+        state.agent._todo_store = TodoStore()
+        state.agent._todo_store.write([
+            {"id": "1", "content": "Read code", "status": "completed"},
+            {"id": "2", "content": "Write tests", "status": "in_progress"},
+            {"id": "3", "content": "Ship it", "status": "pending"},
+        ])
+        result = agent._handle_slash_command("/plan", state)
+        assert "3 items" in result
+        assert "Read code" in result
+        assert "[x]" in result
+        assert "[~]" in result
+        assert "[ ]" in result
+
+    def test_plan_with_arg(self, agent, mock_manager):
+        """`/plan <task>` should acknowledge the task."""
+        state = self._make_state(mock_manager)
+        result = agent._handle_slash_command("/plan refactor the auth module", state)
+        assert result is not None
+        assert "refactor the auth module" in result
+        assert "execution plan" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# Client capabilities storage
+# ---------------------------------------------------------------------------
+
+
+class TestClientCapabilities:
+    @pytest.mark.asyncio
+    async def test_initialize_stores_client_capabilities(self, agent):
+        """initialize() should store client_capabilities on the agent."""
+        from acp.schema import ClientCapabilities
+
+        caps = ClientCapabilities(terminal=True)
+        resp = await agent.initialize(
+            protocol_version=1,
+            client_capabilities=caps,
+            client_info=Implementation(name="test-editor", version="1.0"),
+        )
+        assert agent._client_capabilities is caps
+        assert agent._client_capabilities.terminal is True
+
+    @pytest.mark.asyncio
+    async def test_initialize_defaults_to_none_capabilities(self, agent):
+        """If no client_capabilities provided, should default to None."""
+        resp = await agent.initialize(protocol_version=1)
+        assert agent._client_capabilities is None

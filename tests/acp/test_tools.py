@@ -234,3 +234,29 @@ class TestExtractLocations:
         args = {"command": "echo hi"}
         locs = extract_locations(args)
         assert locs == []
+
+
+# ---------------------------------------------------------------------------
+# build_tool_start with terminal_id (client terminal)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildToolStartClientTerminal:
+    def test_terminal_with_terminal_id_uses_ref(self):
+        """Terminal tool with terminal_id should use TerminalToolCallContent."""
+        from acp.schema import TerminalToolCallContent
+
+        args = {"command": "ls", "terminal_id": "term-abc123"}
+        result = build_tool_start("tc-client-1", "terminal", args)
+        assert isinstance(result, ToolCallStart)
+        assert result.kind == "execute"
+        assert len(result.content) >= 1
+        assert isinstance(result.content[0], TerminalToolCallContent)
+        assert result.content[0].terminal_id == "term-abc123"
+
+    def test_terminal_without_terminal_id_uses_text(self):
+        """Terminal tool without terminal_id should use normal text content."""
+        args = {"command": "ls"}
+        result = build_tool_start("tc-2", "terminal", args)
+        assert isinstance(result, ToolCallStart)
+        assert not isinstance(result.content[0], TerminalToolCallContent)

@@ -138,8 +138,13 @@ def build_tool_start(
         )
 
     if tool_name == "terminal":
-        command = arguments.get("command", "")
-        content = [acp.tool_content(acp.text_block(f"$ {command}"))]
+        # If a terminal_id was provided (client terminal), use a terminal ref
+        terminal_id = arguments.get("terminal_id")
+        if terminal_id:
+            content = [acp.tool_terminal_ref(terminal_id)]
+        else:
+            command = arguments.get("command", "")
+            content = [acp.tool_content(acp.text_block(f"$ {command}"))]
         return acp.start_tool_call(
             tool_call_id, title, kind=kind, content=content, locations=locations,
             raw_input=arguments,

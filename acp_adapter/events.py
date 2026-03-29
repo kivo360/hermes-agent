@@ -11,9 +11,10 @@ import asyncio
 import json
 import logging
 from collections import deque
-from typing import Any, Callable, Deque, Dict
+from typing import Any, Callable, Deque, Dict, Optional
 
 import acp
+from acp.schema import EnvVariable
 
 from .tools import (
     build_tool_complete,
@@ -169,3 +170,147 @@ def make_message_cb(
         _send_update(conn, session_id, loop, update)
 
     return _message
+
+
+# ------------------------------------------------------------------
+# Plan callback
+# ------------------------------------------------------------------
+
+
+def make_plan_cb(
+    conn: acp.Client,
+    session_id: str,
+    loop: asyncio.AbstractEventLoop,
+) -> Callable:
+    """Create a ``plan_callback`` for AIAgent.
+
+    Signature expected by AIAgent::
+
+        plan_callback(entries: list[dict])
+
+    Each dict has keys: ``content`` (str), ``priority`` (high/medium/low),
+    ``status`` (pending/in_progress/completed).  Converts them to
+    ``acp.plan_entry()`` objects and sends an ``AgentPlanUpdate`` to
+    the editor.
+    """
+
+    def _plan(entries: list[dict]) -> None:
+        if not entries:
+            return
+        try:
+            plan_entries = []
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                priority = entry.get("priority", "medium")
+                status = entry.get("status", "pending")
+                # Validate priority and status against the literal types
+                if priority not in ("high", "medium", "low"):
+                    priority = "medium"
+                if status not in ("pending", "in_progress", "completed"):
+                    status = "pending"
+                plan_entries.append(
+                    acp.plan_entry(
+                        content=str(entry.get("content", "")),
+                        priority=priority,
+                        status=status,
+                    )
+                )
+            if plan_entries:
+                update = acp.update_plan(plan_entries)
+                _send_update(conn, session_id, loop, update)
+        except Exception:
+            logger.debug("Failed to send ACP plan update", exc_info=True)
+
+    return _plan
+
+
+# ------------------------------------------------------------------
+# Client-side terminal callback
+# ------------------------------------------------------------------
+
+
+def make_client_terminal_cb(
+    conn: acp.Client,
+    session_id: str,
+    loop: asyncio.AbstractEventLoop,
+    client_capabilities: Any,
+) -> Callable:
+    """Create a ``client_terminal_callback`` for AIAgent.
+
+    Signature expected by AIAgent::
+
+        client_terminal(command, args, cwd, env) -> str | None
+
+    If the client supports terminals, the command is executed in the
+    editor's native terminal UI and output is returned.  Returns ``None``
+    if client terminals are not available so the caller falls back to
+    Hermes's built-in terminal tool.
+    """
+
+    def _client_terminal(
+        command: str,
+        args: list | None = None,
+        cwd: str | None = None,
+        env: dict | None = None,
+    ) -> Optional[str]:
+        # Check if the client supports terminals
+        if not getattr(client_capabilities, "terminal", False):
+            return None
+
+        try:
+            # Build env list from dict if provided
+            env_list = None
+            if env and isinstance(env, dict):
+                env_list = [
+                    EnvVariable(name=str(k), value=str(v))
+                    for k, v in env.items()
+                ]
+
+            # Submit the coroutine from the worker thread
+            future = asyncio.run_coroutine_threadsafe(
+                _run_client_terminal(conn, session_id, command, args, cwd, env_list),
+                loop,
+            )
+            return future.result(timeout=120)
+        except Exception:
+            logger.debug("Client terminal execution failed", exc_info=True)
+            return None
+
+    return _client_terminal
+
+
+async def _run_client_terminal(
+    conn: acp.Client,
+    session_id: str,
+    command: str,
+    args: list | None,
+    cwd: str | None,
+    env: list[EnvVariable] | None,
+) -> Optional[str]:
+    """Async helper: create a client terminal, wait for exit, collect output."""
+    create_resp = await conn.create_terminal(
+        command=command,
+        session_id=session_id,
+        args=args or None,
+        cwd=cwd or None,
+        env=env,
+    )
+    terminal_id = getattr(create_resp, "terminal_id", None)
+    if not terminal_id:
+        logger.warning("Client terminal creation returned no terminal_id")
+        return None
+
+    try:
+        # Wait for the terminal to exit
+        await conn.wait_for_terminal_exit(session_id, terminal_id)
+        # Collect output
+        output_resp = await conn.terminal_output(session_id, terminal_id)
+        output = getattr(output_resp, "output", "") or ""
+        return output
+    finally:
+        # Always release the terminal
+        try:
+            await conn.release_terminal(session_id, terminal_id)
+        except Exception:
+            logger.debug("Failed to release client terminal %s", terminal_id, exc_info=True)

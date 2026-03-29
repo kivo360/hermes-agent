@@ -12,7 +12,7 @@ import acp
 from acp.schema import (
     AgentCapabilities,
     AuthenticateResponse,
-    AuthMethod,
+    AuthMethodEnvVar,
     ClientCapabilities,
     EmbeddedResourceContentBlock,
     ForkSessionResponse,
@@ -39,7 +39,9 @@ from acp.schema import (
 
 from acp_adapter.auth import detect_provider, has_provider
 from acp_adapter.events import (
+    make_client_terminal_cb,
     make_message_cb,
+    make_plan_cb,
     make_step_cb,
     make_thinking_cb,
     make_tool_progress_cb,
@@ -85,6 +87,7 @@ class HermesACPAgent(acp.Agent):
         super().__init__()
         self.session_manager = session_manager or SessionManager()
         self._conn: Optional[acp.Client] = None
+        self._client_capabilities: Optional[ClientCapabilities] = None
 
     # ---- Connection lifecycle -----------------------------------------------
 
@@ -109,7 +112,7 @@ class HermesACPAgent(acp.Agent):
         auth_methods = None
         if provider:
             auth_methods = [
-                AuthMethod(
+                AuthMethodEnvVar(
                     id=provider,
                     name=f"{provider} runtime credentials",
                     description=f"Authenticate Hermes using the currently configured {provider} runtime credentials.",
@@ -122,6 +125,9 @@ class HermesACPAgent(acp.Agent):
             client_name,
             resolved_protocol_version,
         )
+
+        # Store client capabilities for feature checks (terminals, fs, etc.)
+        self._client_capabilities = client_capabilities
 
         return InitializeResponse(
             protocol_version=acp.PROTOCOL_VERSION,
@@ -266,18 +272,26 @@ class HermesACPAgent(acp.Agent):
             step_cb = make_step_cb(conn, session_id, loop, tool_call_ids)
             message_cb = make_message_cb(conn, session_id, loop)
             approval_cb = make_approval_callback(conn.request_permission, loop, session_id)
+            plan_cb = make_plan_cb(conn, session_id, loop)
+            client_terminal_cb = make_client_terminal_cb(
+                conn, session_id, loop, self._client_capabilities
+            )
         else:
             tool_progress_cb = None
             thinking_cb = None
             step_cb = None
             message_cb = None
             approval_cb = None
+            plan_cb = None
+            client_terminal_cb = None
 
         agent = state.agent
         agent.tool_progress_callback = tool_progress_cb
         agent.thinking_callback = thinking_cb
         agent.step_callback = step_cb
         agent.message_callback = message_cb
+        agent.plan_callback = plan_cb
+        agent.client_terminal_callback = client_terminal_cb
 
         if approval_cb:
             try:
@@ -346,6 +360,7 @@ class HermesACPAgent(acp.Agent):
         "reset": "Clear conversation history",
         "compact": "Compress conversation context",
         "version": "Show Hermes version",
+        "plan": "Show current plan status or create a plan for a task",
     }
 
     def _handle_slash_command(self, text: str, state: SessionState) -> str | None:
@@ -366,6 +381,7 @@ class HermesACPAgent(acp.Agent):
             "reset": self._cmd_reset,
             "compact": self._cmd_compact,
             "version": self._cmd_version,
+            "plan": self._cmd_plan,
         }.get(cmd)
 
         if handler is None:
@@ -476,6 +492,39 @@ class HermesACPAgent(acp.Agent):
 
     def _cmd_version(self, args: str, state: SessionState) -> str:
         return f"Hermes Agent v{HERMES_VERSION}"
+
+    def _cmd_plan(self, args: str, state: SessionState) -> str:
+        """Show current plan status or prompt the user to describe a task."""
+        agent = state.agent
+        todo_store = getattr(agent, "_todo_store", None)
+
+        if not args:
+            # No argument — show current plan status
+            if todo_store and hasattr(todo_store, "_items") and todo_store._items:
+                items = todo_store._items
+                lines = [f"Current plan ({len(items)} items):", ""]
+                status_icons = {
+                    "pending": "[ ]",
+                    "in_progress": "[~]",
+                    "completed": "[x]",
+                    "cancelled": "[-]",
+                }
+                for item in items:
+                    content = item.get("content", "?")
+                    status = item.get("status", "pending")
+                    icon = status_icons.get(status, "[ ]")
+                    lines.append(f"  {icon} {content}")
+                    if status != "pending":
+                        lines.append(f"       (status: {status})")
+                return "\n".join(lines)
+            return "No active plan. Use /plan <task description> to create one."
+
+        # Argument provided — tell the user the agent will create a plan
+        return (
+            f"Plan request noted for: {args}\n\n"
+            "The agent will create an execution plan when you send your next message. "
+            "Describe your task in detail and the agent will break it down into steps."
+        )
 
     # ---- Model switching (ACP protocol method) -------------------------------
 
