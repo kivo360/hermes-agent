@@ -31,6 +31,7 @@ import { execFileSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
 import { matchesAllowedSender, matchesAllowedUser, matchesInboundWhatsAppGroup, parseAllowedUsers } from './allowlist.js';
+import { isArchivedChat, archiveGroupMessage } from './group_archive.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import {
@@ -548,6 +549,27 @@ async function startSocket() {
 
       // Handle fromMe messages based on mode
       let fromOwner = false;
+      // Archive the owner's own group messages before any fromMe filtering —
+      // without this, Kevin's texts in the archived group would be missing
+      // from the history. Still skipped for bot-echo protection below.
+      if (msg.key.fromMe && isArchivedChat(chatId)) {
+        try {
+          const archiveEvent = await extractBridgeEvent({
+            msg,
+            chatId,
+            senderId: resolvedSenderId,
+            senderNumber,
+            botIds,
+            isGroup,
+            downloadMedia: null, // archive text metadata only — no media downloads for fromMe
+            cacheDirs: {},
+            logger,
+          });
+          archiveGroupMessage(archiveEvent, { fromMe: true });
+        } catch (archiveErr) {
+          console.error('[archive] fromMe archive failed:', archiveErr && archiveErr.message);
+        }
+      }
       if (msg.key.fromMe) {
         if (isGroup || chatId.includes('status')) {
           emitDebugEvent({
@@ -763,6 +785,10 @@ async function startSocket() {
       }
 
       messageStore.remember(msg);
+      // Scoped archive: persist this message only if it's from the archived group
+      if (isArchivedChat(chatId)) {
+        archiveGroupMessage(event, { fromMe: !!msg.key.fromMe });
+      }
       // Remember this message's already-downloaded media/text so a later
       // reply to it (even uncaptioned media) can resolve the original
       // content instead of seeing only a stripped-down quoted-message stub.
@@ -1116,6 +1142,22 @@ app.get('/chat/:id', async (req, res) => {
     isGroup,
     participants: [],
   });
+});
+
+// Scoped group archive read endpoints (Artificial Collective only)
+import { archiveStats, readArchiveMessages } from './group_archive.js';
+
+app.get('/archive/stats', (req, res) => {
+  res.json(archiveStats());
+});
+
+app.get('/archive/messages', (req, res) => {
+  const limit = Math.max(1, Math.min(500, parseInt(req.query.limit, 10) || 50));
+  res.json(readArchiveMessages({
+    limit,
+    sender: req.query.sender || null,
+    q: req.query.q || null,
+  }));
 });
 
 // Health check
